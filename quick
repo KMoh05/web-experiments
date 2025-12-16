@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+UART Device Interaction Script
+
+Handles serial communication with miro Edge 7688 device:
+1. Opens UART port at 115200 8n1
+2. Waits for console activation prompt
+3. Activates console by sending Enter
+4. Waits for root prompt
+5. Sends configuration command
+"""
+
+import time
+import sys
+from pathlib import Path
+
+try:
+    from serial import Serial, SerialException
+    from serial import EIGHTBITS, PARITY_NONE, STOPBITS_ONE
+except ImportError:
+    print("ERROR: pyserial is not installed!")
+    print("Please install it with: pip.exe install pyserial")
+    sys.exit(1)
+
+
+
+class UARTDeviceInteractor:
+    def __init__(self, port='COM9', baudrate=115200, timeout=30):
+        """
+        Initialize UART connection.
+
+        Args:
+            port: Serial port path (Windows: COM9, Linux: /dev/ttyUSB0, etc.)
+            baudrate: Serial communication speed (default: 115200)
+            timeout: Read timeout in seconds (default: 30)
+        """
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+
+    def connect(self):
+        """Establish serial connection."""
+        try:
+            self.ser = Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=EIGHTBITS,
+                parity=PARITY_NONE,
+                stopbits=STOPBITS_ONE,
+                timeout=self.timeout
+            )
+            print(f"✓ Connected to {self.port} at {self.baudrate} baud")
+            return True
+        except SerialException as e:
+            print(f"✗ Failed to connect to {self.port}: {e}")
+            return False
+
+    def disconnect(self):
+        """Close serial connection."""
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            print("✓ Disconnected from serial port")
+
+    def read_until(self, target_text, max_time=None):
+        """
+        Read from serial until target text is found.
+
+        Args:
+            target_text: Text to search for
+            max_time: Maximum time to wait in seconds (uses self.timeout if None)
+
+        Returns:
+            Tuple of (success: bool, accumulated_data: str)
+        """
+        if max_time is None:
+            max_time = self.timeout
+
+        buffer = ""
+        start_time = time.time()
+
+        while time.time() - start_time < max_time:
+            try:
+                if self.ser.in_waiting:
+                    data = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='replace')
+                    buffer += data
+                    print(data, end='', flush=True)
+
+                    # Check if target text is in buffer
+                    if target_text in buffer:
+                        return True, buffer
+                else:
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f"\n✗ Error reading from serial: {e}")
+                return False, buffer
+
+        print(f"\n✗ Timeout waiting for '{target_text}'")
+        return False, buffer
+
+    def send_command(self, command, add_newline=True):
+        """
+        Send command via serial.
+
+        Args:
+            command: Command string to send
+            add_newline: Whether to append newline (default: True)
+        """
+        try:
+            full_command = command + ('\n' if add_newline else '')
+            self.ser.write(full_command.encode('utf-8'))
+            self.ser.flush()
+            print(f"→ Sent: {command}")
+            return True
+        except Exception as e:
+            print(f"✗ Error sending command: {e}")
+            return False
+
+    def send_enter_for_console(self):
+        """Send Enter to activate console (retry up to 3 times until prompt appears)."""
+        print("\n[1/4] Sending Enter to activate console...")
+        max_attempts = 3
+        target_prompt = "root@miro_Edge:/#"
+
+        for attempt in range(1, max_attempts + 1):
+            print(f"      Attempt {attempt}/{max_attempts}...")
+            time.sleep(0.3)
+            self.send_command("")  # Send newline
+            time.sleep(0.3)
+
+            # Read any incoming data after sending newline
+            buffer = ""
+            if self.ser.in_waiting:
+                data = self.ser.read(self.ser.in_waiting).decode('utf-8', errors='replace')
+                buffer += data
+                print(data, end='', flush=True)
+
+            # Check if we got the prompt
+            if target_prompt in buffer:
+                print("\n✓ Console activated")
+                return True
+
+        print("\n✓ Newlines sent (prompt not yet visible)")
+        time.sleep(0.5)
+        return True
+
+    def send_zerotier_config_command(self):
+        """Send the ZeroTier configuration command."""
+        print("\n[2/4] Sending ZeroTier configuration command...")
+        command = "sed -i 's/option join/list join/' /etc/config/zerotier"
+        self.send_command(command)
+
+        # Wait for command completion (prompt return)
+        time.sleep(2)
+        success, _ = self.read_until("root@miro_Edge:/#", max_time=5)
+        return success
+
+    def verify_zerotier_config(self):
+        """Verify the ZeroTier configuration was applied."""
+        print("\n[3/4] Verifying ZeroTier configuration...")
+        command = "grep \"list join 'a09acf0233cfded6'\" /etc/config/zerotier"
+        self.send_command(command)
+
+        # Wait for command output (should contain the grep result)
+        time.sleep(1)
+        success, output = self.read_until("root@miro_Edge:/#", max_time=5)
+
+        # Check if the line was found in the output
+        if "list join 'a09acf0233cfded6'" in output:
+            print("\n✓ Configuration line found in /etc/config/zerotier")
+            return True
+        else:
+            print("\n✗ Configuration line NOT found in /etc/config/zerotier")
+            return False
+
+    def run_full_interaction(self):
+        """Execute the complete interaction sequence."""
+        print("=" * 60)
+        print("miro Edge 7688 UART Device Interaction")
+        print("=" * 60)
+
+        # Connect
+        if not self.connect():
+            return False
+
+        try:
+            # Step 1: Send Enter to activate console
+            if not self.send_enter_for_console():
+                print("✗ Failed to send Enter")
+                return False
+
+            print("\n✓ Console ready")
+
+            # Step 2: Send configuration command
+            if not self.send_zerotier_config_command():
+                print("⚠ Command may not have completed properly")
+
+            # Step 3: Verify configuration
+            verification_success = self.verify_zerotier_config()
+
+            # Print final result with clear pass/fail
+            self._print_final_result(verification_success)
+
+            return verification_success
+
+        except KeyboardInterrupt:
+            print("\n\n✗ Interrupted by user")
+            self._print_final_result(False)
+            return False
+        except Exception as e:
+            print(f"\n✗ Unexpected error: {e}")
+            self._print_final_result(False)
+            return False
+        finally:
+            self.disconnect()
+
+    def _print_final_result(self, success):
+        """Print a clear, visually distinct pass/fail result."""
+        print("\n")
+        print("╔" + "=" * 58 + "╗")
+
+        if success:
+            print("║" + " " * 58 + "║")
+            print("║" + "  ✓ SUCCESS - CONFIGURATION APPLIED AND VERIFIED  ".center(58) + "║")
+            print("║" + " " * 58 + "║")
+            print("║" + "  ZeroTier configuration has been successfully updated.  ".center(58) + "║")
+            print("║" + "  The line 'list join' now appears in /etc/config/zerotier.  ".center(58) + "║")
+            print("║" + " " * 58 + "║")
+        else:
+            print("║" + " " * 58 + "║")
+            print("║" + "  ✗ FAILED - CONFIGURATION VERIFICATION DID NOT PASS  ".center(58) + "║")
+            print("║" + " " * 58 + "║")
+            print("║" + "  The expected configuration line was not found.  ".center(58) + "║")
+            print("║" + "  Please check the device configuration manually.  ".center(58) + "║")
+            print("║" + " " * 58 + "║")
+
+        print("╚" + "=" * 58 + "╝")
+
+
+def main():
+    """Main entry point."""
+    # Parse command line arguments
+    # Default port depends on OS (COM9 for Windows, /dev/ttyUSB0 for Linux)
+    import platform
+    default_port = 'COM9' if platform.system() == 'Windows' else '/dev/ttyUSB0'
+    port = default_port
+
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+
+    print("\n" + "=" * 60)
+    print("miro Edge 7688 - Endless Loop Mode")
+    print("=" * 60)
+    print(f"Serial Port: {port}")
+    print("Press Ctrl+C to exit the loop at any time\n")
+
+    loop_count = 0
+    success_count = 0
+    failure_count = 0
+
+    try:
+        while True:
+            loop_count += 1
+            print("\n" + "=" * 60)
+            print(f"ITERATION {loop_count}")
+            print("=" * 60)
+
+            # Wait for user input at the start of each iteration
+            try:
+                response = input("\nPress ENTER to start test (or type 'exit' to quit): ").strip().lower()
+                if response == 'exit':
+                    print("\n✓ Exiting endless loop mode")
+                    break
+            except EOFError:
+                pass
+
+            # Create new interactor for each iteration
+            interactor = UARTDeviceInteractor(port=port, baudrate=115200, timeout=30)
+            success = interactor.run_full_interaction()
+
+            if success:
+                success_count += 1
+            else:
+                failure_count += 1
+
+            # Show statistics after each iteration
+            print("\n" + "=" * 60)
+            print("LOOP STATISTICS")
+            print("=" * 60)
+            print(f"Total iterations: {loop_count}")
+            print(f"Successful:       {success_count}")
+            print(f"Failed:           {failure_count}")
+            print("=" * 60)
+
+    except KeyboardInterrupt:
+        print("\n\n" + "=" * 60)
+        print("INTERRUPTED BY USER (Ctrl+C)")
+        print("=" * 60)
+        print(f"Total iterations completed: {loop_count}")
+        print(f"Successful:                 {success_count}")
+        print(f"Failed:                     {failure_count}")
+        print("=" * 60 + "\n")
+
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
